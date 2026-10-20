@@ -1,0 +1,211 @@
+# TopoDroid csv export -> geopackage with centerline, splays and stations (3D).
+# Run from the QGIS python console editor. Layer/field names are what
+# cave_walls_qgis.py expects.
+#
+# No loop closure, stations are just walked out from the first one.
+# Fine for this cave, use survex/therion if there are loops.
+#
+# ENTRANCE = first station in CRS coords, None puts it at 0,0,0.
+# DECLINATION = mag. declination - grid convergence (~+4.5 in SLO 2026, check it)
+
+import csv
+import math
+import os
+
+from qgis.core import (QgsProject, QgsVectorLayer, QgsVectorFileWriter, QgsField, QgsFeature,
+                       QgsGeometry, QgsLineString, QgsPoint, QgsCoordinateTransformContext, Qgis)
+from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtGui import QColor
+from qgis.PyQt.QtWidgets import QFileDialog
+
+CSV_PATH = ""      # empty -> file dialog
+OUTPUT_GPKG = ""   # empty -> same name as csv
+CRS = "EPSG:3794"  # D96/TM
+ENTRANCE = None    # e.g. (480123.4, 52345.6, 785.0)
+DECLINATION = 0.0
+
+
+def read_csv(path, decl=0.0):
+    legs, splays = [], []
+    with open(path, encoding="utf-8") as f:
+        for r in csv.reader(l for l in f if not l.startswith("#")):
+            if len(r) < 5 or not r[2].strip():
+                continue
+            r += [""] * (8 - len(r))
+            shot = {
+                "from": r[0].split("@")[0].strip(),
+                "to": r[1].split("@")[0].strip(),
+                "length": float(r[2]),
+                "azimuth": (float(r[3]) + decl) % 360,
+                "clino": float(r[4]),
+                "extend": r[5].strip(),
+                "flags": r[6].strip(),
+                "comment": r[7].strip(),
+            }
+            if shot["to"] in ("-", ""):
+                splays.append(shot)
+            else:
+                legs.append(shot)
+    return legs, splays
+
+
+def vec(s):
+    az, cl = math.radians(s["azimuth"]), math.radians(s["clino"])
+    h = s["length"] * math.cos(cl)
+    return h * math.sin(az), h * math.cos(az), s["length"] * math.sin(cl)
+
+
+def walk(legs, origin):
+    pos = {legs[0]["from"]: tuple(origin)}
+    todo = list(legs)
+    changed = True
+    while todo and changed:
+        changed = False
+        for leg in todo[:]:
+            a, b = leg["from"], leg["to"]
+            dx, dy, dz = vec(leg)
+            if a in pos and b not in pos:
+                x, y, z = pos[a]
+                pos[b] = (x + dx, y + dy, z + dz)
+            elif b in pos and a not in pos:
+                x, y, z = pos[b]
+                pos[a] = (x - dx, y - dy, z - dz)
+            elif a not in pos:
+                continue
+            todo.remove(leg)
+            changed = True
+    return pos, todo  # todo = legs not connected to first station
+
+
+def make_layer(geom, name, fields, feats):
+    types = {"s": QVariant.String, "d": QVariant.Double}
+    lyr = QgsVectorLayer(f"{geom}?crs={CRS}", name, "memory")
+    lyr.dataProvider().addAttributes([QgsField(n, types[t]) for n, t in fields])
+    lyr.updateFields()
+    out = []
+    for g, attrs in feats:
+        f = QgsFeature(lyr.fields())
+        f.setGeometry(g)
+        f.setAttributes(attrs)
+        out.append(f)
+    lyr.dataProvider().addFeatures(out)
+    lyr.updateExtents()
+    return lyr
+
+
+def line(p, q):
+    return QgsGeometry(QgsLineString([QgsPoint(*p), QgsPoint(*q)]))
+
+
+def style_3d(lyr, kind):
+    # enum names moved around between qgis versions, hence the fallbacks
+    try:
+        from qgis._3d import (QgsLine3DSymbol, QgsPoint3DSymbol, QgsVectorLayer3DRenderer,
+                              QgsPhongMaterialSettings, Qgs3DTypes)
+        if kind == "point":
+            sym = QgsPoint3DSymbol()
+            try:
+                sym.setShape(Qgis.Point3DShape.Sphere)
+            except AttributeError:
+                sym.setShape(QgsPoint3DSymbol.Sphere)
+            sym.setShapeProperties({"radius": 0.3})
+            col = QColor(220, 40, 40)
+        else:
+            sym = QgsLine3DSymbol()
+            sym.setRenderAsSimpleLines(True)
+            if kind == "centerline":
+                sym.setWidth(2.0)
+                col = QColor(30, 80, 200)
+            else:
+                sym.setWidth(1.0)
+                col = QColor(150, 150, 150)
+            try:
+                sym.setAltitudeBinding(Qgis.AltitudeBinding.Vertex)
+            except AttributeError:
+                sym.setAltitudeBinding(Qgs3DTypes.AltBindVertex)
+        try:
+            sym.setAltitudeClamping(Qgis.AltitudeClamping.Absolute)
+        except AttributeError:
+            sym.setAltitudeClamping(Qgs3DTypes.AltClampAbsolute)
+        mat = QgsPhongMaterialSettings()
+        mat.setDiffuse(col)
+        mat.setAmbient(col)
+        sym.setMaterialSettings(mat)
+        lyr.setRenderer3D(QgsVectorLayer3DRenderer(sym))
+    except Exception as e:
+        print(f"no 3D style for {lyr.name()}: {e}")
+
+
+def run():
+    csv_path = CSV_PATH or QFileDialog.getOpenFileName(None, "TopoDroid CSV", "", "CSV (*.csv)")[0]
+    if not csv_path:
+        return
+    gpkg = OUTPUT_GPKG or os.path.splitext(csv_path)[0] + ".gpkg"
+
+    legs, splays = read_csv(csv_path, DECLINATION)
+    if not legs:
+        raise RuntimeError("no legs in csv")
+    origin = ENTRANCE or (0.0, 0.0, 0.0)
+    z0 = origin[2]
+    pos, unconnected = walk(legs, origin)
+
+    cl = make_layer("LineStringZ", "centerline",
+                    [("from_st", "s"), ("to_st", "s"), ("length", "d"), ("azimuth", "d"),
+                     ("clino", "d"), ("extend", "s"), ("flags", "s"), ("comment", "s")],
+                    [(line(pos[l["from"]], pos[l["to"]]),
+                      [l["from"], l["to"], l["length"], l["azimuth"], l["clino"],
+                       l["extend"], l["flags"], l["comment"]])
+                     for l in legs if l["from"] in pos and l["to"] in pos])
+
+    sp_feats = []
+    for s in splays:
+        if s["from"] not in pos:
+            continue
+        x, y, z = pos[s["from"]]
+        dx, dy, dz = vec(s)
+        sp_feats.append((line((x, y, z), (x + dx, y + dy, z + dz)),
+                         [s["from"], s["length"], s["azimuth"], s["clino"], s["flags"], s["comment"]]))
+    sp = make_layer("LineStringZ", "splays",
+                    [("station", "s"), ("length", "d"), ("azimuth", "d"), ("clino", "d"),
+                     ("flags", "s"), ("comment", "s")],
+                    sp_feats)
+
+    st = make_layer("PointZ", "stations", [("name", "s"), ("z", "d"), ("depth", "d")],
+                    [(QgsGeometry(QgsPoint(*p)), [n, round(p[2], 2), round(p[2] - z0, 2)])
+                     for n, p in pos.items()])
+
+    ctx = QgsCoordinateTransformContext()
+    for i, lyr in enumerate((cl, sp, st)):
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = lyr.name()
+        if i == 0:
+            opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+        else:
+            opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+        err = QgsVectorFileWriter.writeAsVectorFormatV3(lyr, gpkg, ctx, opts)
+        if err[0] != QgsVectorFileWriter.NoError:
+            raise RuntimeError(f"writing {lyr.name()} failed: {err}")
+
+    # drop layers from a previous run
+    project = QgsProject.instance()
+    for name in ("centerline", "splays", "stations"):
+        for old in project.mapLayersByName(name):
+            project.removeMapLayer(old.id())
+    for name, kind in (("splays", "splay"), ("centerline", "centerline"), ("stations", "point")):
+        lyr = QgsVectorLayer(f"{gpkg}|layername={name}", name, "ogr")
+        style_3d(lyr, kind)
+        project.addMapLayer(lyr)
+
+    zs = [p[2] - z0 for p in pos.values()]
+    total = sum(l["length"] for l in legs)
+    print(f"saved {gpkg}")
+    print(f"{len(pos)} stations, {len(legs)} legs ({total:.1f} m), {len(splays)} splays, "
+          f"z {min(zs):.1f} to {max(zs):.1f} m")
+    if unconnected:
+        print("not connected:", ", ".join(f"{l['from']}-{l['to']}" for l in unconnected))
+    if ENTRANCE is None:
+        print("ENTRANCE not set, cave is at 0,0,0")
+
+
+run()
