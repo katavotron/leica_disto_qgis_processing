@@ -1,0 +1,167 @@
+# Rough cave walls from the stations + splays layers (run in QGIS python console).
+#
+# Splay ends of each station get wrapped in a convex hull. Where hulls of two
+# stations overlap, the bits inside the other hull are cut off so they join up
+# into one surface. Stations with < 3 splays are skipped.
+# Result goes to a 'walls' layer in the same gpkg as the splays.
+
+import numpy as np
+from qgis.core import (QgsProject, QgsVectorLayer, QgsField, QgsFeature, QgsGeometry,
+                       QgsVectorFileWriter, QgsCoordinateTransformContext, Qgis)
+from qgis.PyQt.QtCore import QVariant
+
+EPS = 1e-6
+
+
+def normal(pts, f):
+    n = np.cross(pts[f[1]] - pts[f[0]], pts[f[2]] - pts[f[0]])
+    return n / (np.linalg.norm(n) + 1e-300)
+
+
+def hull(pts):
+    # incremental 3D convex hull, returns triangles (index triples) facing out
+    a = 0
+    b = np.argmax(np.linalg.norm(pts - pts[a], axis=1))
+    d = np.argmax(np.linalg.norm(np.cross(pts - pts[a], pts[b] - pts[a]), axis=1))
+    vol = np.abs((pts - pts[a]) @ np.cross(pts[b] - pts[a], pts[d] - pts[a]))
+    e = np.argmax(vol)
+    if vol[e] < 1e-9:  # flat
+        return None
+    c = pts[[a, b, d, e]].mean(axis=0)
+
+    faces = []
+    for f in [(a, b, d), (a, b, e), (a, d, e), (b, d, e)]:
+        if normal(pts, f) @ (pts[f[0]] - c) > 0:
+            faces.append(f)
+        else:
+            faces.append((f[0], f[2], f[1]))
+
+    for i in range(len(pts)):
+        seen = [f for f in faces if normal(pts, f) @ (pts[i] - pts[f[0]]) > EPS]
+        if not seen:
+            continue
+        edges = {e for f in seen for e in ((f[0], f[1]), (f[1], f[2]), (f[2], f[0]))}
+        faces = [f for f in faces if f not in seen]
+        faces += [(u, v, i) for u, v in edges if (v, u) not in edges]
+    return faces
+
+
+def clip(poly, n, d, keep_out):
+    # keep the part of poly on one side of plane n.x + d = 0
+    s = 1 if keep_out else -1
+    res = []
+    for p, q in zip(poly, poly[1:] + poly[:1]):
+        dp, dq = s * (n @ p + d), s * (n @ q + d)
+        if dp >= -EPS:
+            res.append(p)
+        if dp * dq < 0 and abs(dp) > EPS and abs(dq) > EPS:
+            res.append(p + dp / (dp - dq) * (q - p))
+    return res if len(res) >= 3 else []
+
+
+def outside(poly, planes):
+    # pieces of poly outside a convex shell
+    if any(all(n @ p + d > -EPS for p in poly) for n, d in planes):
+        return [poly]
+    pieces = []
+    for n, d in planes:
+        piece = clip(poly, n, d, True)
+        if piece:
+            pieces.append(piece)
+        poly = clip(poly, n, d, False)
+        if not poly:
+            break
+    return pieces  # whatever is left in poly is inside, drop it
+
+
+def make_walls(points):
+    shells = {}
+    for s, pts in points.items():
+        faces = hull(pts) if len(pts) >= 4 else None
+        if not faces:
+            continue
+        planes = []
+        for f in faces:
+            n = normal(pts, f)
+            planes.append((n, -n @ pts[f[0]]))
+        shells[s] = (pts, faces, planes)
+
+    walls = {}
+    for s, (pts, faces, _) in shells.items():
+        polys = [[pts[i] for i in f] for f in faces]
+        for t, (other, _, planes) in shells.items():
+            if t == s:
+                continue
+            # only bother if bounding boxes overlap
+            if np.all(other.max(0) >= pts.min(0)) and np.all(other.min(0) <= pts.max(0)):
+                polys = [piece for poly in polys for piece in outside(poly, planes)]
+        walls[s] = polys
+    return walls
+
+
+def xyz(v):
+    return [v.x(), v.y(), v.z()]
+
+
+def run():
+    proj = QgsProject.instance()
+    stations = proj.mapLayersByName("stations")[0]
+    splays = proj.mapLayersByName("splays")[0]
+
+    points = {}
+    for f in stations.getFeatures():
+        points[str(f["name"])] = [xyz(next(f.geometry().vertices()))]
+    for f in splays.getFeatures():
+        end = list(f.geometry().vertices())[-1]
+        points.setdefault(str(f["station"]), []).append(xyz(end))
+
+    walls = make_walls({s: np.array(p, float) for s, p in points.items()})
+
+    out = QgsVectorLayer(f"MultiPolygonZ?crs={splays.crs().authid()}", "walls", "memory")
+    out.dataProvider().addAttributes([QgsField("station", QVariant.String)])
+    out.updateFields()
+    feats = []
+    for s, polys in walls.items():
+        if not polys:  # completely inside other shells
+            continue
+        rings = []
+        for poly in polys:
+            coords = ", ".join("%f %f %f" % tuple(p) for p in poly + poly[:1])
+            rings.append(f"(({coords}))")
+        f = QgsFeature(out.fields())
+        f.setGeometry(QgsGeometry.fromWkt(f"MultiPolygonZ ({', '.join(rings)})"))
+        f.setAttributes([s])
+        feats.append(f)
+    out.dataProvider().addFeatures(feats)
+
+    for old in proj.mapLayersByName("walls"):
+        proj.removeMapLayer(old.id())
+
+    gpkg = splays.source().split("|")[0]
+    if gpkg.lower().endswith(".gpkg"):
+        opts = QgsVectorFileWriter.SaveVectorOptions()
+        opts.driverName = "GPKG"
+        opts.layerName = "walls"
+        opts.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteLayer
+        QgsVectorFileWriter.writeAsVectorFormatV3(out, gpkg, QgsCoordinateTransformContext(), opts)
+        out = QgsVectorLayer(f"{gpkg}|layername=walls", "walls", "ogr")
+
+    try:
+        from qgis._3d import QgsPolygon3DSymbol, QgsVectorLayer3DRenderer, Qgs3DTypes
+        sym = QgsPolygon3DSymbol()
+        sym.setAltitudeClamping(Qgis.AltitudeClamping.Absolute)
+        sym.setAltitudeBinding(Qgis.AltitudeBinding.Vertex)
+        sym.setCullingMode(Qgs3DTypes.NoCulling)
+        sym.setAddBackFaces(True)
+        out.setRenderer3D(QgsVectorLayer3DRenderer(sym))
+    except Exception as e:
+        print("no 3D style, set it by hand (absolute / vertex / no culling):", e)
+    proj.addMapLayer(out)
+
+    skipped = sorted(set(points) - set(walls), key=lambda x: (len(x), x))
+    print(f"{len(walls)} shells")
+    if skipped:
+        print("no shell for:", ", ".join(skipped))
+
+
+run()
